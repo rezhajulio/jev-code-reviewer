@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
 export const credentialsPath = join(homedir(), '.config', 'jev-reviewer', 'credentials.json');
-const KEY_LABELS = Object.freeze({ TYPESAFE_API_KEY: 'Jev / TypeSafe API key', OPENAI_API_KEY: 'OpenAI API key' });
+const KEY_LABELS = Object.freeze({ TYPESAFE_API_KEY: 'Jev / TypeSafe API key (optional)', OPENAI_API_KEY: 'OpenAI API key' });
 
 // Where each key is, never what it is. Stored keys win over the environment
 // (see resolveCredentials in src/providers.mjs).
@@ -104,6 +104,7 @@ export async function setupKeys({ replaceOpenAI = process.argv.includes('--repla
   const updated = { ...existing };
   let changed = false;
   console.log('Jev-Reviewer key setup. Input is hidden. Keys are stored outside the repository.');
+  console.log('The TypeSafe key is optional: without it, Jev classification uses free classifier.dev (no key needed).');
   for (const entry of keySources(existing, env)) {
     const label = KEY_LABELS[entry.name];
     if (!(replaceOpenAI && entry.name === 'OPENAI_API_KEY')) {
@@ -111,7 +112,13 @@ export async function setupKeys({ replaceOpenAI = process.argv.includes('--repla
         console.log(`${label}: ${describeKeySource(entry)} (value hidden).`);
         continue;
       }
-      if (entry.environment) {
+      if (entry.name === 'TYPESAFE_API_KEY' && !entry.environment) {
+        console.log(`${label}: ${describeKeySource(entry)}.`);
+        if (await confirm('Use free classifier.dev for Jev classification instead of a TypeSafe key? [Y/n] ')) {
+          console.log(`${label}: skipped — Jev will use free classifier.dev (no key needed).`);
+          continue;
+        }
+      } else if (entry.environment) {
         // An exported key only works in shells that load it; agent shells often do not.
         console.log(`${label}: ${describeKeySource(entry)}.`);
         if (await confirm(`Store this shell's value in ${credentialsPath}? [Y/n] `)) {
@@ -131,9 +138,12 @@ export async function setupKeys({ replaceOpenAI = process.argv.includes('--repla
   }
   if (changed) await saveCredentials(updated);
   if (changed) console.log(`Saved to ${credentialsPath} (owner-only file permissions; not encrypted).`);
-  const unstored = keySources(updated, env).filter((entry) => !entry.stored).map((entry) => entry.name);
+  const unstored = keySources(updated, env)
+    .filter((entry) => !entry.stored && entry.name !== 'TYPESAFE_API_KEY')
+    .map((entry) => entry.name);
   if (unstored.length) console.log(`Warning: ${unstored.join(' and ')} ${unstored.length > 1 ? 'are' : 'is'} not stored, so analyze fails in shells without ${unstored.length > 1 ? 'them' : 'it'}.`);
-  else console.log('Both keys are stored.');
+  else if (keySources(updated, env).some((entry) => entry.name === 'TYPESAFE_API_KEY' && entry.stored)) console.log('Both keys are stored.');
+  else console.log('OpenAI key stored. Jev will use free classifier.dev (no TypeSafe key stored).');
   console.log('API access has not been tested yet. Run jev-reviewer doctor to test it (one small request to each provider).');
   console.log('You can now tell the agent: keys are ready. Do not send the key values.');
 }

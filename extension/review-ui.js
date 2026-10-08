@@ -135,7 +135,8 @@
   }
 
   function provenanceText(report) {
-    const classification = report.provenance.classification === "live-typesafe-api"
+    const liveClassifiers = ["live-typesafe-api", "live-classifier-dev-api", "live-custom-jev-api"];
+    const classification = liveClassifiers.includes(report.provenance.classification)
       ? report.mode === "replay" ? "Recorded Jev decisions" : "Live Jev decisions"
       : "Jev decision provenance unverified";
     const explanations = report.provenance.explanations === "prepared-copy"

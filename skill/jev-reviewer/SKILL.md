@@ -23,7 +23,7 @@ Do not create, push, or modify a PR solely to make analysis possible unless the 
 
 ## Live analysis
 
-Live analysis requires locally configured `TYPESAFE_API_KEY` for Jev classification and `OPENAI_API_KEY` for natural-language explanations. Before analyzing, run this check. It prints where each key comes from and whether each provider accepts it, never a key value, so it is safe in an agent transcript:
+Live analysis requires a locally configured `OPENAI_API_KEY` for natural-language explanations. Jev classification needs no key: it uses classifier.dev's free tier by default, switching to TypeSafe's keyed System One endpoint when `TYPESAFE_API_KEY` is configured. Before analyzing, run this check. It prints where each key comes from and whether each provider accepts it, never a key value, so it is safe in an agent transcript:
 
 ```bash
 jev-reviewer doctor
