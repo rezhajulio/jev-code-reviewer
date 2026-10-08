@@ -7,6 +7,7 @@ import {
   classifyWithJev,
   explainWithOpenAI,
   providerDefaults,
+  resolveJevRoute,
 } from '../src/providers.mjs';
 
 const UNIT = {
@@ -83,6 +84,24 @@ function response(body, { ok = true, status = 200 } = {}) {
 }
 
 const credentials = { TYPESAFE_API_KEY: 'ts-secret', OPENAI_API_KEY: 'oa-secret' };
+
+// Runs fn with every Jev routing input scrubbed, so the ambient environment
+// cannot steer route resolution.
+async function withCleanJevEnv(fn) {
+  const saved = {};
+  for (const name of ['TYPESAFE_API_KEY', 'CLASSIFIER_API_KEY', 'JEV_API_URL']) {
+    saved[name] = process.env[name];
+    delete process.env[name];
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
 
 test('uses OpenAI for prose and Jev for the actual priority', async () => {
   const mock = providerFetch();
@@ -270,7 +289,7 @@ test('checkProviders sends one small request per provider and names the key sour
   const mock = providerFetch();
   const healthy = await checkProviders({ credentials, fetchImpl: mock.fetchImpl });
   assert.deepEqual(healthy.openai, { ok: true });
-  assert.deepEqual(healthy.jev, { ok: true });
+  assert.deepEqual(healthy.jev, { ok: true, provider: 'typesafe' });
   assert.equal(mock.calls.length, 2);
 
   const previous = process.env.OPENAI_API_KEY;
@@ -333,4 +352,133 @@ test('reports progress after each analyzed unit', async () => {
     { index: 2, total: 2, path: 'src/auth.mjs', priority: 'P0' },
   ]);
   assert.ok(events.every((event) => Number.isFinite(event.elapsedMs) && event.elapsedMs >= 0));
+});
+
+test('resolveJevRoute prefers an explicit endpoint, then a TypeSafe key, then free classifier.dev', async () => {
+  await withCleanJevEnv(async () => {
+    assert.deepEqual(resolveJevRoute({}, {}), {
+      url: 'https://classifier.dev/v1/systemone',
+      provider: 'classifier.dev',
+      apiKey: undefined,
+      keyName: undefined,
+      keySource: undefined,
+    });
+    const keyed = resolveJevRoute({ credentials: { TYPESAFE_API_KEY: 'ts-secret' } }, {});
+    assert.equal(keyed.url, 'https://api.typesafe.ai/v1/systemone');
+    assert.equal(keyed.provider, 'typesafe');
+    assert.equal(keyed.apiKey, 'ts-secret');
+    assert.equal(keyed.keyName, 'TYPESAFE_API_KEY');
+    const explicit = resolveJevRoute(
+      { credentials: { TYPESAFE_API_KEY: 'ts-secret' }, jevEndpoint: 'https://proxy.internal/v1/systemone' },
+      {},
+    );
+    assert.equal(explicit.url, 'https://proxy.internal/v1/systemone');
+    assert.equal(explicit.provider, 'custom');
+    assert.equal(explicit.apiKey, 'ts-secret');
+  });
+});
+
+test('uses free classifier.dev for Jev when no TypeSafe key is configured', async () => {
+  await withCleanJevEnv(async () => {
+    const mock = providerFetch();
+    const changes = await analyzeWithProviders([UNIT], {
+      credentials: { OPENAI_API_KEY: 'oa-secret' },
+      fetchImpl: mock.fetchImpl,
+      loadCredentialsImpl: async () => ({}),
+    });
+    const jev = mock.calls.find((call) => call.url.includes('classifier.dev'));
+    assert.equal(jev.url, 'https://classifier.dev/v1/systemone');
+    assert.equal(jev.init.headers.Authorization, undefined);
+    assert.equal(jev.body.model, 'jev-latest');
+    assert.match(JSON.stringify(jev.body.state), /keepTrustedSessions/);
+    assert.equal(changes[0].priority, 'P0');
+    assert.equal(changes[0].providerMetadata.jev.provider, 'classifier.dev');
+    assert.equal(changes[0].providerMetadata.jev.viaFallback, false);
+  });
+});
+
+test('JEV_API_URL overrides the Jev endpoint', async () => {
+  await withCleanJevEnv(async () => {
+    process.env.JEV_API_URL = 'https://proxy.internal/v1/systemone';
+    const mock = providerFetch();
+    const classification = await classifyWithJev(UNIT, {
+      credentials: { TYPESAFE_API_KEY: 'ts-secret' },
+      fetchImpl: mock.fetchImpl,
+      loadCredentialsImpl: async () => ({}),
+    });
+    assert.equal(mock.calls.length, 1);
+    assert.equal(mock.calls[0].url, 'https://proxy.internal/v1/systemone');
+    assert.equal(mock.calls[0].init.headers.Authorization, 'Bearer ts-secret');
+    assert.equal(classification.providerMetadata.jev.provider, 'custom');
+    assert.equal(classification.providerMetadata.jev.endpoint, 'https://proxy.internal/v1/systemone');
+  });
+});
+
+test('falls back to keyed TypeSafe when free classifier.dev is rate-limited', async () => {
+  await withCleanJevEnv(async () => {
+    process.env.JEV_API_URL = 'https://classifier.dev/v1/systemone';
+    const mock = providerFetch();
+    const urls = [];
+    const fetchImpl = async (url, init) => {
+      urls.push(url);
+      if (url.includes('classifier.dev')) {
+        return response({ error: { code: 'rate_limited' } }, { ok: false, status: 429 });
+      }
+      return mock.fetchImpl(url, init);
+    };
+    const changes = await analyzeWithProviders([UNIT], {
+      credentials: { OPENAI_API_KEY: 'oa-secret', TYPESAFE_API_KEY: 'ts-secret' },
+      fetchImpl,
+      loadCredentialsImpl: async () => ({}),
+    });
+    assert.deepEqual(
+      urls.filter((url) => !url.includes('openai.com')),
+      ['https://classifier.dev/v1/systemone', 'https://api.typesafe.ai/v1/systemone'],
+    );
+    const fallbackCall = mock.calls.find((call) => call.url.includes('typesafe.ai'));
+    assert.equal(fallbackCall.init.headers.Authorization, 'Bearer ts-secret');
+    assert.equal(changes[0].providerMetadata.jev.provider, 'typesafe');
+    assert.equal(changes[0].providerMetadata.jev.viaFallback, true);
+  });
+});
+
+test('a rate-limited free tier without a TypeSafe key explains the limit instead of blaming a key', async () => {
+  await withCleanJevEnv(async () => {
+    const mock = providerFetch();
+    const fetchImpl = async (url, init) => url.includes('openai.com')
+      ? mock.fetchImpl(url, init)
+      : response({ error: { code: 'rate_limited' } }, { ok: false, status: 429 });
+    await assert.rejects(
+      analyzeWithProviders([UNIT], {
+        credentials: { OPENAI_API_KEY: 'oa-secret' },
+        fetchImpl,
+        loadCredentialsImpl: async () => ({}),
+      }),
+      (error) => {
+        assert.match(error.message, /Jev request failed \(HTTP 429\)/);
+        assert.match(error.message, /free classifier\.dev tier is rate-limited/);
+        assert.match(error.message, /TYPESAFE_API_KEY/);
+        assert.doesNotMatch(error.message, /oa-secret/);
+        return true;
+      },
+    );
+  });
+});
+
+test('checkProviders reports which Jev route answered', async () => {
+  await withCleanJevEnv(async () => {
+    const mock = providerFetch();
+    const keyless = await checkProviders({
+      credentials: { OPENAI_API_KEY: 'oa-secret' },
+      fetchImpl: mock.fetchImpl,
+      loadCredentialsImpl: async () => ({}),
+    });
+    assert.deepEqual(keyless.jev, { ok: true, provider: 'classifier.dev' });
+    const keyed = await checkProviders({
+      credentials: { OPENAI_API_KEY: 'oa-secret', TYPESAFE_API_KEY: 'ts-secret' },
+      fetchImpl: mock.fetchImpl,
+      loadCredentialsImpl: async () => ({}),
+    });
+    assert.deepEqual(keyed.jev, { ok: true, provider: 'typesafe' });
+  });
 });

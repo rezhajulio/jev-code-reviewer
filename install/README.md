@@ -30,7 +30,7 @@ An existing target is left untouched. `--force` moves it to a timestamped backup
 
 ## CLI setup is separate
 
-Live analysis requires both `TYPESAFE_API_KEY` for Jev classification and `OPENAI_API_KEY` for natural-language explanations. Configure them locally by running:
+Live analysis requires `OPENAI_API_KEY` for natural-language explanations. Jev classification works without a key via classifier.dev's free tier; `TYPESAFE_API_KEY` is optional and selects TypeSafe's keyed endpoint instead. Configure them locally by running:
 
 ```bash
 jev-reviewer setup
