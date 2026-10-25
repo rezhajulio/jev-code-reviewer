@@ -9,7 +9,8 @@ Local checkout + git + gh
    Jev-Reviewer CLI ---- optional Graphify context
        |        |
        |        +---- OpenAI: old logic / new logic / what changed
-       |        +---- TypeSafe Jev: structured review priority
+       |        +---- Jev: structured review priority (classifier.dev free tier by
+       |                 default, TypeSafe System One when TYPESAFE_API_KEY is set)
        v
 ~/.cache/jev-reviewer/reviews
            |
@@ -27,7 +28,7 @@ Local checkout + git + gh
 
 `bin/jev-reviewer.mjs` owns the workflow:
 
-- `setup` collects the TypeSafe and OpenAI keys with hidden terminal input and stores them outside the repository.
+- `setup` collects the OpenAI key (required) and the TypeSafe key (optional) with hidden terminal input and stores them outside the repository. Without a TypeSafe key, Jev classification uses classifier.dev's free, keyless System One-compatible endpoint.
 - `analyze --pr <github-pr-url> --repo <path>` resolves the pull request with `gh`, reads the local checkout and Git history, invokes the providers, applies policy, and writes a cached report.
 - `serve` exposes cached reports to the same-computer browser extension over loopback only.
 - `demo` serves the bundled recorded report replay. It does not call either model provider.
@@ -50,7 +51,7 @@ Those summaries are an interface over the code, not an authoritative replacement
 
 ### Priority classification
 
-TypeSafe Jev produces the structured classification signal. Policy then maps the available evidence to the project's P0/P1/P2 meanings:
+Jev produces the structured classification signal. Policy then maps the available evidence to the project's P0/P1/P2 meanings:
 
 - P0: human review required
 - P1: human review recommended
@@ -82,7 +83,7 @@ The extension fails open to source code. When the feature is off, the local serv
 
 ## Data and trust boundaries
 
-Live analysis is not fully offline. Relevant private source, diff, and context are sent to the configured TypeSafe Jev and OpenAI APIs. Teams must decide whether those providers and their configured data controls are acceptable before analyzing private code.
+Live analysis is not fully offline. Relevant private source, diff, and context are sent to the configured Jev provider (classifier.dev by default, TypeSafe when `TYPESAFE_API_KEY` is set) and OpenAI APIs. Teams must decide whether those providers and their configured data controls are acceptable before analyzing private code.
 
 The credential file is stored outside the repository with owner-only filesystem permissions, but it is not encrypted at rest. Environment variables can also satisfy provider configuration. The browser extension receives cached review results and a local pairing token; it must never receive `TYPESAFE_API_KEY` or `OPENAI_API_KEY`.
 
@@ -95,5 +96,6 @@ The portable skill tells a coding agent to run analysis after it creates or upda
 ## Provider contracts
 
 - [TypeSafe quick start](https://docs.typesafe.ai/introduction/quickstart) and [Choice primitive](https://docs.typesafe.ai/primitives/choice): direct System One endpoint, typed choices and distributions.
+- [classifier.dev developers](https://classifier.dev/developers): free, keyless System One wire-compatible endpoint (`POST /v1/systemone`) used when no `TYPESAFE_API_KEY` is configured.
 - [OpenAI Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create) and [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs): schema-constrained prose, with `store: false` in this client.
 - [Graphify](https://github.com/Graphify-Labs/graphify): local code-only structural extraction. Static neighbors do not prove runtime impact.

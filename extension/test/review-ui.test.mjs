@@ -69,6 +69,25 @@ test("retains explicit provider provenance, coverage, and review notes", () => {
   assert.equal(ui.provenanceText(report), "Recorded Jev decisions · prepared demo explanations");
 });
 
+test("labels live classifier.dev and custom Jev reports as live decisions", () => {
+  for (const classification of ["live-classifier-dev-api", "live-custom-jev-api"]) {
+    const report = ui.normalizeReport({
+      mode: "live",
+      provenance: { classification, explanations: "live-openai-api", note: "" },
+      coverage: { total: 1, analyzed: 1, unanalysed: 0 },
+      changes: [],
+    });
+    assert.equal(ui.provenanceText(report), "Live Jev decisions · OpenAI explanations", classification);
+  }
+  const unknown = ui.normalizeReport({
+    mode: "live",
+    provenance: { classification: "live-something-else", explanations: "live-openai-api", note: "" },
+    coverage: { total: 1, analyzed: 1, unanalysed: 0 },
+    changes: [],
+  });
+  assert.equal(ui.provenanceText(unknown), "Jev decision provenance unverified · OpenAI explanations");
+});
+
 test("recognizes the classic and new Files changed pages", () => {
   const classic = { owner: "egma-ai", repo: "egma", pullRequest: 376, view: "files" };
   const reactPage = { ...classic, view: "changes" };

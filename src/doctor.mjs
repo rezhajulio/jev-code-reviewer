@@ -24,6 +24,10 @@ export async function runDoctor({ live = true, port = 4731, log = console.log } 
   catch (error) { line('fail', error.message); }
   const sources = keySources(stored);
   for (const entry of sources) {
+    if (entry.name === 'TYPESAFE_API_KEY' && !entry.used) {
+      line('info', 'TYPESAFE_API_KEY: not set — Jev classification will use free classifier.dev (no key needed). Set it for the keyed TypeSafe route.');
+      continue;
+    }
     const status = entry.used === 'stored' ? 'ok' : entry.used === 'environment' ? 'warn' : 'fail';
     line(status, `${entry.name}: ${describeKeySource(entry)}.${status === 'ok' ? '' : ' Run jev-reviewer setup in your own terminal.'}`);
   }
@@ -39,13 +43,13 @@ export async function runDoctor({ live = true, port = 4731, log = console.log } 
   line('info', 'Extension pairing is checked in Chrome: its Connection → Save button confirms the token.');
 
   if (!live) line('info', 'Provider check skipped (--offline).');
-  else if (sources.some((entry) => !entry.used)) line('info', 'Provider check skipped because a key is missing.');
+  else if (sources.some((entry) => entry.name !== 'TYPESAFE_API_KEY' && !entry.used)) line('info', 'Provider check skipped because the OpenAI key is missing.');
   else {
     log('Checking provider access (one small request to each provider)…');
     try {
       const { checkProviders } = await import('./providers.mjs');
       const result = await checkProviders();
-      line(result.jev.ok ? 'ok' : 'fail', result.jev.ok ? 'TypeSafe Jev accepted the key' : result.jev.error);
+      line(result.jev.ok ? 'ok' : 'fail', result.jev.ok ? `Jev accepted the request via ${result.jev.provider}` : result.jev.error);
       line(result.openai.ok ? 'ok' : 'fail', result.openai.ok ? 'OpenAI accepted the key and has quota' : result.openai.error);
     } catch (error) {
       line('fail', error.message);

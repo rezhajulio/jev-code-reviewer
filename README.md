@@ -27,7 +27,7 @@ Needs the [GitHub CLI](https://cli.github.com/) signed in (`gh auth login`) and 
 
 ```sh
 npm link                 # adds the jev-reviewer command
-jev-reviewer setup       # stores your TypeSafe and OpenAI keys; run it in your own terminal
+jev-reviewer setup       # stores your keys (Jev works keyless via free classifier.dev); run it in your own terminal
 jev-reviewer doctor      # checks tools, key sources, the local server, and provider access
 jev-reviewer serve       # leave running
 jev-reviewer analyze --pr https://github.com/OWNER/REPO/pull/123 --repo /path/to/clone
@@ -43,8 +43,8 @@ Optional: `uv tool install graphifyy` adds a local code graph for better context
 
 ## Good to know
 
-- **Your code leaves your machine.** `analyze` sends changed code and nearby context to TypeSafe and OpenAI. The extension only talks to the local server on `127.0.0.1:4731`.
-- **Keys** are stored in `~/.config/jev-reviewer/credentials.json` (owner-only, not encrypted). Prefer this over exported variables, which a coding agent's shell often cannot see. Replace an OpenAI key with `node scripts/setup-keys.mjs --replace-openai`.
+- **Your code leaves your machine.** `analyze` sends changed code and nearby context to the Jev provider and OpenAI. The Jev provider is [classifier.dev](https://classifier.dev)'s free tier by default (no key needed); set `TYPESAFE_API_KEY` to use TypeSafe's keyed System One endpoint instead, or point `JEV_API_URL` / `--jev-endpoint` at any System One-compatible endpoint. The extension only talks to the local server on `127.0.0.1:4731`.
+- **Keys** are stored in `~/.config/jev-reviewer/credentials.json` (owner-only, not encrypted). Only the OpenAI key is required. Prefer this over exported variables, which a coding agent's shell often cannot see. Replace an OpenAI key with `node scripts/setup-keys.mjs --replace-openai`. A `CLASSIFIER_API_KEY` (classifier.dev workspace key) raises the free-tier limits when set.
 - **Coverage is capped.** The first 12 change units (diff hunks) in path order are analyzed; `--max-units` allows up to 100. Files with an unanalyzed change keep GitHub's code, and the CLI and popup say how many.
 - **Classic Files changed page only.** GitHub's new `/changes` page is not supported yet; switch back under your profile picture → **Feature preview**.
 - **Old reports are never shown.** If the PR has newer commits, the extension keeps GitHub's code: rerun `analyze`, then click **Refresh report**.

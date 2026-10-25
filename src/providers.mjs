@@ -2,6 +2,7 @@ import { loadCredentials } from '../scripts/setup-keys.mjs';
 
 const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
 const TYPESAFE_SYSTEM_ONE_URL = 'https://api.typesafe.ai/v1/systemone';
+const CLASSIFIER_DEV_SYSTEM_ONE_URL = 'https://classifier.dev/v1/systemone';
 const DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna';
 const DEFAULT_JEV_MODEL = 'jev-latest';
 const MAX_PACKET_CHARS = 30_000;
@@ -31,7 +32,11 @@ export async function analyzeWithProviders(units, options = {}) {
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
   if (typeof fetchImpl !== 'function') throw new Error('No fetch implementation is available.');
 
-  const { values: credentials, sources } = await resolveCredentials(options, ['TYPESAFE_API_KEY', 'OPENAI_API_KEY']);
+  const stored = await loadMissingCredentials(options, ['TYPESAFE_API_KEY', 'CLASSIFIER_API_KEY', 'OPENAI_API_KEY']);
+  const openai = resolveKey(options, stored, 'OPENAI_API_KEY');
+  requireSecret(openai.value, 'OPENAI_API_KEY');
+  const jevRoute = resolveJevRoute(options, stored);
+  const sources = keySourceMap(options, stored);
 
   const model = options.model ?? process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL;
   const jevModel = options.jevModel ?? process.env.JEV_MODEL ?? DEFAULT_JEV_MODEL;
@@ -44,9 +49,10 @@ export async function analyzeWithProviders(units, options = {}) {
     const started = Date.now();
     const packet = buildContextPacket(unit, policy);
     const [explanation, classification] = await Promise.all([
-      requestOpenAI({ fetchImpl, apiKey: credentials.OPENAI_API_KEY, model, packet: packet.serialized }),
-      requestJev({ fetchImpl, apiKey: credentials.TYPESAFE_API_KEY, model: jevModel, packet: packet.state, policy }),
-    ]).catch((error) => { throw annotateKeySource(error, sources); });
+      requestOpenAI({ fetchImpl, apiKey: openai.value, model, packet: packet.serialized })
+        .catch((error) => { throw annotateKeySource(error, sources); }),
+      requestJevRouted({ fetchImpl, route: jevRoute, model: jevModel, packet: packet.state, policy, sources }),
+    ]);
 
     const priority = applyUncertaintyPolicy(classification, policy);
 
@@ -68,6 +74,9 @@ export async function analyzeWithProviders(units, options = {}) {
         },
         jev: {
           model: classification.model,
+          provider: classification.provider,
+          endpoint: classification.endpoint,
+          viaFallback: Boolean(classification.viaFallback),
           probabilities: classification.probabilities,
           humanReviewProbability: classification.humanReviewProbability,
           dominantRisk: classification.dominantRisk,
@@ -96,36 +105,39 @@ const PROBE_UNIT = Object.freeze({
 });
 
 export async function checkProviders(options = {}) {
-  const { values, sources } = await resolveCredentials(options, ['TYPESAFE_API_KEY', 'OPENAI_API_KEY']);
-  const shared = { ...options, credentials: values };
+  const stored = await loadMissingCredentials(options, ['TYPESAFE_API_KEY', 'CLASSIFIER_API_KEY', 'OPENAI_API_KEY']);
+  const credentials = {};
+  const sources = {};
+  for (const name of ['TYPESAFE_API_KEY', 'CLASSIFIER_API_KEY', 'OPENAI_API_KEY']) {
+    const resolved = resolveKey(options, stored, name);
+    if (resolved.value) { credentials[name] = resolved.value; sources[name] = resolved.source; }
+  }
+  requireSecret(credentials.OPENAI_API_KEY, 'OPENAI_API_KEY');
+  const shared = { ...options, credentials };
   const [openai, jev] = await Promise.allSettled([
     explainWithOpenAI(PROBE_UNIT, shared),
     classifyWithJev(PROBE_UNIT, shared),
   ]);
-  const outcome = (settled) => settled.status === 'fulfilled'
+  const openaiOutcome = openai.status === 'fulfilled'
     ? { ok: true }
-    : { ok: false, error: annotateKeySource(settled.reason, sources).message };
-  return { sources, openai: outcome(openai), jev: outcome(jev) };
+    : { ok: false, error: annotateKeySource(openai.reason, sources).message };
+  const jevOutcome = jev.status === 'fulfilled'
+    ? { ok: true, provider: jev.value.providerMetadata.jev.provider }
+    : { ok: false, error: jev.reason?.message ?? String(jev.reason) };
+  return { sources, openai: openaiOutcome, jev: jevOutcome };
 }
 
 export async function classifyWithJev(unit, options = {}) {
   validateUnits([unit]);
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
   if (typeof fetchImpl !== 'function') throw new Error('No fetch implementation is available.');
-  const stored = await loadMissingCredentials(options, ['TYPESAFE_API_KEY']);
-  const apiKey =
-    options.credentials?.TYPESAFE_API_KEY ?? stored.TYPESAFE_API_KEY ?? process.env.TYPESAFE_API_KEY;
-  requireSecret(apiKey, 'TYPESAFE_API_KEY');
+  const stored = await loadMissingCredentials(options, ['TYPESAFE_API_KEY', 'CLASSIFIER_API_KEY']);
+  const route = resolveJevRoute(options, stored);
+  const sources = keySourceMap(options, stored);
   const policy = options.policy ?? {};
   const model = options.jevModel ?? process.env.JEV_MODEL ?? DEFAULT_JEV_MODEL;
   const packet = buildContextPacket(unit, policy);
-  const classification = await requestJev({
-    fetchImpl,
-    apiKey,
-    model,
-    packet: packet.state,
-    policy,
-  });
+  const classification = await requestJevRouted({ fetchImpl, route, model, packet: packet.state, policy, sources });
   return {
     id: unit.id,
     priority: applyUncertaintyPolicy(classification, policy),
@@ -135,6 +147,9 @@ export async function classifyWithJev(unit, options = {}) {
     providerMetadata: {
       jev: {
         model: classification.model,
+        provider: classification.provider,
+        endpoint: classification.endpoint,
+        viaFallback: Boolean(classification.viaFallback),
         probabilities: classification.probabilities,
         humanReviewProbability: classification.humanReviewProbability,
         dominantRisk: classification.dominantRisk,
@@ -234,7 +249,111 @@ async function requestOpenAI({ fetchImpl, apiKey, model, packet }) {
   };
 }
 
-async function requestJev({ fetchImpl, apiKey, model, packet, policy }) {
+// Which Jev service answers a classification request. classifier.dev exposes a
+// TypeSafe System One wire-compatible endpoint, so the request and response
+// shapes are identical on both routes; only the URL and the auth header differ.
+export function resolveJevRoute(options = {}, stored = {}) {
+  const explicit = [options.jevEndpoint, process.env.JEV_API_URL]
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .find(Boolean);
+  const typesafeKey = resolveKey(options, stored, 'TYPESAFE_API_KEY');
+  const classifierKey = resolveKey(options, stored, 'CLASSIFIER_API_KEY');
+  if (explicit) {
+    const provider = providerNameForUrl(explicit);
+    // A TypeSafe-shaped key is only ever sent to a TypeSafe host; everywhere
+    // else the classifier.dev workspace key wins, falling back to the TypeSafe
+    // key for generic proxies.
+    const key = provider === 'typesafe'
+      ? typesafeKey
+      : provider === 'classifier.dev'
+        ? classifierKey
+        : classifierKey.value ? classifierKey : typesafeKey;
+    return makeJevRoute(explicit, key, typesafeKey);
+  }
+  if (typesafeKey.value) return makeJevRoute(TYPESAFE_SYSTEM_ONE_URL, typesafeKey, typesafeKey);
+  return makeJevRoute(CLASSIFIER_DEV_SYSTEM_ONE_URL, classifierKey, typesafeKey);
+}
+
+function makeJevRoute(url, key, typesafeKey) {
+  const provider = providerNameForUrl(url);
+  const route = {
+    url,
+    provider,
+    apiKey: key.value,
+    keyName: key.value ? key.name : undefined,
+    keySource: key.value ? key.source : undefined,
+  };
+  // A keyless classifier.dev request that hits the free-tier limit fails over to
+  // the caller's own keyed TypeSafe route when one is configured. The reverse
+  // never happens: a configured key must not silently reroute code elsewhere.
+  if (provider === 'classifier.dev' && !key.value && typesafeKey.value && typesafeKey !== key) {
+    route.fallback = {
+      url: TYPESAFE_SYSTEM_ONE_URL,
+      provider: 'typesafe',
+      apiKey: typesafeKey.value,
+      keyName: typesafeKey.name,
+      keySource: typesafeKey.source,
+    };
+  }
+  return route;
+}
+
+function providerNameForUrl(url) {
+  let host = '';
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return 'custom';
+  }
+  // Hostname suffix match, so fakeclassifier.dev is not mistaken for the service.
+  if (host === 'api.typesafe.ai' || host.endsWith('.typesafe.ai')) return 'typesafe';
+  if (host === 'classifier.dev' || host.endsWith('.classifier.dev')) return 'classifier.dev';
+  return 'custom';
+}
+
+// Precedence: caller-supplied, then the stored credentials file, then the environment.
+function resolveKey(options, stored, name) {
+  const candidates = [
+    ['option', options.credentials?.[name]],
+    ['stored', stored?.[name]],
+    ['environment', process.env[name]],
+  ];
+  for (const [source, value] of candidates) {
+    if (typeof value === 'string' && value.trim()) return { value: value.trim(), source, name };
+  }
+  return { value: undefined, source: undefined, name };
+}
+
+function keySourceMap(options, stored) {
+  const sources = {};
+  for (const name of ['TYPESAFE_API_KEY', 'CLASSIFIER_API_KEY', 'OPENAI_API_KEY']) {
+    const { source } = resolveKey(options, stored, name);
+    if (source) sources[name] = source;
+  }
+  return sources;
+}
+
+async function requestJevRouted({ fetchImpl, route, model, packet, policy, sources }) {
+  try {
+    return await requestJev({ fetchImpl, route, model, packet, policy });
+  } catch (error) {
+    if (route.fallback && isRetryableProviderError(error)) {
+      try {
+        const result = await requestJev({ fetchImpl, route: route.fallback, model, packet, policy });
+        return { ...result, viaFallback: true };
+      } catch (fallbackError) {
+        throw annotateKeySource(fallbackError, sources, route.fallback);
+      }
+    }
+    throw annotateKeySource(error, sources, route);
+  }
+}
+
+function isRetryableProviderError(error) {
+  return Number.isInteger(error?.httpStatus) && (error.httpStatus === 429 || error.httpStatus >= 500);
+}
+
+async function requestJev({ fetchImpl, route, model, packet, policy }) {
   const criteria = priorityCriteria(policy);
   const body = {
     model,
@@ -272,12 +391,13 @@ async function requestJev({ fetchImpl, apiKey, model, packet, policy }) {
     },
   };
 
-  const response = await safeFetch(fetchImpl, TYPESAFE_SYSTEM_ONE_URL, {
+  const headers = { 'Content-Type': 'application/json' };
+  // classifier.dev needs no key; sending an empty or placeholder Authorization
+  // header would only mislead, so keyless requests carry no auth header at all.
+  if (route.apiKey) headers.Authorization = `Bearer ${route.apiKey}`;
+  const response = await safeFetch(fetchImpl, route.url, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify(body),
   }, 'Jev');
   const data = await safeJson(response, 'Jev');
@@ -300,6 +420,8 @@ async function requestJev({ fetchImpl, apiKey, model, packet, policy }) {
     dominantRisk: safeMetadataString(riskAnswer.choice, 'unknown'),
     humanReviewProbability: humanReview.noul,
     model: safeMetadataString(data?.model, model),
+    provider: route.provider,
+    endpoint: route.url,
     usage: normalizeUsage(data?.usage),
   };
 }
@@ -327,7 +449,9 @@ async function safeFetch(fetchImpl, url, init, provider) {
       // Response bodies are intentionally ignored unless they contain allowlisted identifiers.
     }
     const detail = identifiers.length ? `; ${identifiers.join('/')}` : '';
-    throw new Error(`${provider} request failed${status}${detail}.`);
+    const error = new Error(`${provider} request failed${status}${detail}.`);
+    if (Number.isInteger(response.status)) error.httpStatus = response.status;
+    throw error;
   }
   return response;
 }
@@ -343,28 +467,31 @@ const KEY_SOURCE_TEXT = Object.freeze({
   environment: "this shell's environment",
 });
 
-// Precedence: caller-supplied, then the stored credentials file, then the environment.
-async function resolveCredentials(options, names) {
-  const stored = await loadMissingCredentials(options, names);
-  const values = {};
-  const sources = {};
-  for (const name of names) {
-    for (const [source, value] of [['option', options.credentials?.[name]], ['stored', stored[name]], ['environment', process.env[name]]]) {
-      if (typeof value === 'string' && value.trim()) { values[name] = value; sources[name] = source; break; }
+// Auth and quota failures name the key's source (never its value), so a stale
+// exported key is distinguishable from a stored one. Keyless classifier.dev
+// failures instead explain the free-tier limit. Already-annotated errors pass
+// through untouched so stacked callers cannot double-annotate.
+function annotateKeySource(error, sources, jevRoute) {
+  if (!error || error.annotatedKeySource) return error;
+  const match = /^(OpenAI|Jev) request failed \(HTTP (?:401|403|429)\)/.exec(error.message || '');
+  if (!match) return error;
+  if (match[1] === 'Jev' && jevRoute && !jevRoute.apiKey && jevRoute.provider === 'classifier.dev') {
+    if (/HTTP 429/.test(error.message)) {
+      return annotated(new Error(
+        `${error.message} The free classifier.dev tier is rate-limited for this IP right now. ` +
+        'Retry later, or set TYPESAFE_API_KEY for the keyed TypeSafe route (used automatically as failover when configured).',
+      ));
     }
-    requireSecret(values[name], name);
+    return error;
   }
-  return { values, sources };
+  const name = match[1] === 'OpenAI' ? 'OPENAI_API_KEY' : (jevRoute?.keyName ?? 'TYPESAFE_API_KEY');
+  const where = KEY_SOURCE_TEXT[sources?.[name]];
+  return where ? annotated(new Error(`${error.message} Key used: ${name} from ${where}.`)) : error;
 }
 
-// Auth and quota failures name the key's source (never its value), so a stale
-// exported key is distinguishable from a stored one.
-function annotateKeySource(error, sources) {
-  const match = /^(OpenAI|Jev) request failed \(HTTP (?:401|403|429)\)/.exec(error?.message || '');
-  if (!match) return error;
-  const name = match[1] === 'OpenAI' ? 'OPENAI_API_KEY' : 'TYPESAFE_API_KEY';
-  const where = KEY_SOURCE_TEXT[sources?.[name]];
-  return where ? new Error(`${error.message} Key used: ${name} from ${where}.`) : error;
+function annotated(error) {
+  error.annotatedKeySource = true;
+  return error;
 }
 
 async function safeJson(response, provider) {
